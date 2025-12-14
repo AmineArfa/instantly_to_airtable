@@ -453,12 +453,16 @@ async def instantly_webhook(request: Request) -> JSONResponse:
     record_id = record["id"]
     fields: Dict[str, Any] = record.get("fields", {}) or {}
 
+    # Compute these early; used by logs/debug traces and enrichment decision logic.
+    provider_missing = _is_blank(fields.get(PROV_COL))
+    gateway_missing = _is_blank(fields.get(GATE_COL))
+
     logger.info(
         "trace_id=%s airtable_found record_id=%s existing_provider_blank=%s existing_gateway_blank=%s",
         trace_id,
         record_id,
-        _is_blank(fields.get(PROV_COL)),
-        _is_blank(fields.get(GATE_COL)),
+        provider_missing,
+        gateway_missing,
     )
     _trace_add(
         trace_id,
@@ -475,8 +479,6 @@ async def instantly_webhook(request: Request) -> JSONResponse:
 
     # If Airtable provider/gateway are empty AND webhook didn't provide them,
     # try fetching from Instantly after the webhook is called.
-    provider_missing = _is_blank(fields.get(PROV_COL))
-    gateway_missing = _is_blank(fields.get(GATE_COL))
     need_provider = provider_missing and _is_blank(email_provider)
     need_gateway = gateway_missing and _is_blank(email_security_gateway)
 
