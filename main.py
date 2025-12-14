@@ -49,6 +49,29 @@ def _iso_utc_now_z() -> str:
     dt = datetime.now(timezone.utc).replace(microsecond=0)
     return dt.isoformat().replace("+00:00", "Z")
 
+def _iso_from_payload_timestamp(value: Optional[str]) -> Optional[str]:
+    """
+    Convert an incoming timestamp to an ISO 8601 UTC 'Z' string if possible.
+    Accepts common webhook formats like '2025-12-14T09:44:18.136Z'.
+    """
+    if not value or not isinstance(value, str):
+        return None
+    s = value.strip()
+    if not s:
+        return None
+    try:
+        # Handle trailing Z
+        if s.endswith("Z"):
+            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        else:
+            dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        dt = dt.astimezone(timezone.utc).replace(microsecond=0)
+        return dt.isoformat().replace("+00:00", "Z")
+    except Exception:
+        return None
+
 
 def _log_date_yyyy_mm_dd() -> str:
     return datetime.now(timezone.utc).date().isoformat()
@@ -70,10 +93,18 @@ def _coalesce_nonempty(new_value: Optional[Any], existing_value: Optional[Any]) 
 
 def _parse_payload(payload: Dict[str, Any]) -> Dict[str, Optional[str]]:
     # Standard fields (flat payload)
-    lead_id = payload.get("lead_id")
-    reply_text = payload.get("reply_text")
-    lead_status = payload.get("lead_status")
-    campaign_name = payload.get("campaign_name")
+    # Note: Instantly payloads vary by event type; we accept common aliases but remain
+    # strict about ONLY updating Airtable when we have a real lead_id.
+    lead_id = payload.get("lead_id") or payload.get("leadId")
+    reply_text = payload.get("reply_text") or payload.get("replyText") or payload.get("reply") or payload.get("message")
+    lead_status = (
+        payload.get("lead_status")
+        or payload.get("leadStatus")
+        or payload.get("event_type")
+        or payload.get("status")
+    )
+    campaign_name = payload.get("campaign_name") or payload.get("campaignName")
+    event_timestamp = payload.get("timestamp") or payload.get("event_timestamp")
 
     # Enrichment fields (may be missing/null)
     email_provider = payload.get("email_provider")
@@ -86,6 +117,7 @@ def _parse_payload(payload: Dict[str, Any]) -> Dict[str, Optional[str]]:
         "campaign_name": str(campaign_name) if campaign_name is not None else None,
         "email_provider": str(email_provider) if email_provider is not None else None,
         "email_security_gateway": str(email_security_gateway) if email_security_gateway is not None else None,
+        "event_timestamp": str(event_timestamp) if event_timestamp is not None else None,
     }
 
 
@@ -108,7 +140,14 @@ async def instantly_webhook(request: Request) -> JSONResponse:
     parsed = _parse_payload(payload)
     lead_id = parsed["lead_id"]
     if not lead_id:
-        raise HTTPException(status_code=400, detail="Missing required field: lead_id")
+        # Instantly may send events (e.g. lead_interested) without a lead_id.
+        # We must remain strict about only updating by instantly_lead_id, so we skip.
+        return JSONResponse(
+            status_code=200,
+            content={
+                "message": "Skipped: Missing lead_id in webhook payload (strict ID-only mode)",
+            },
+        )
 
     table = _airtable_table()
 
@@ -129,10 +168,11 @@ async def instantly_webhook(request: Request) -> JSONResponse:
     email_provider = parsed["email_provider"]
     email_security_gateway = parsed["email_security_gateway"]
     reply_text = parsed["reply_text"] or ""
+    event_ts_iso = _iso_from_payload_timestamp(parsed.get("event_timestamp")) or _iso_utc_now_z()
 
     update_fields: Dict[str, Any] = {
         STATUS_COL: _coalesce_nonempty(lead_status, fields.get(STATUS_COL)),
-        DATE_COL: _iso_utc_now_z(),
+        DATE_COL: event_ts_iso,
         CAMP_COL: _coalesce_nonempty(campaign_name, fields.get(CAMP_COL)),
         PROV_COL: _coalesce_nonempty(email_provider, fields.get(PROV_COL)),
         GATE_COL: _coalesce_nonempty(email_security_gateway, fields.get(GATE_COL)),
@@ -144,7 +184,11 @@ async def instantly_webhook(request: Request) -> JSONResponse:
     new_log = (existing_log + "\n\n" + log_entry).strip() if existing_log else log_entry
     update_fields[LOG_COL] = new_log
 
-    table.update(record_id, update_fields)
+    try:
+        table.update(record_id, update_fields)
+    except Exception as e:
+        # Return a clear error so the failure is diagnosable in Vercel logs.
+        raise HTTPException(status_code=500, detail=f"Airtable update failed: {e}")
 
     return JSONResponse(status_code=200, content={"message": "Success: Record enriched and updated"})
 
