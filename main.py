@@ -1,7 +1,6 @@
 import logging
 import os
 import uuid
-from collections import deque
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple
 
@@ -33,7 +32,6 @@ TABLE_NAME = "tblHBBta5IyXclFln"
 INSTANTLY_API_KEY = os.getenv("INSTANTLY_API_KEY", "").strip()
 INSTANTLY_API_BASE = (os.getenv("INSTANTLY_API_BASE") or "https://api.instantly.ai").strip().rstrip("/")
 WEBHOOK_DEBUG = (os.getenv("WEBHOOK_DEBUG") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
-WEBHOOK_VIEW_TOKEN = (os.getenv("WEBHOOK_VIEW_TOKEN") or "").strip()
 
 # Airtable field mapping (Exact Columns)
 ID_COL = "instantly_lead_id"  # Search key
@@ -52,8 +50,6 @@ app = FastAPI(title="Instantly.ai → Airtable Webhook Bridge")
 _ESP_MAP_CACHE: Dict[str, str] = {}
 _ESP_MAP_CACHE_TS: Optional[datetime] = None
 _ESP_MAP_CACHE_TTL_SECONDS = 6 * 60 * 60  # 6 hours
-
-_TRACE_BUFFER: "deque[Dict[str, Any]]" = deque(maxlen=50)
 
 
 def _require_env() -> None:
@@ -125,9 +121,46 @@ def _is_blank(value: Optional[Any]) -> bool:
 
 
 def _instantly_headers() -> Dict[str, str]:
-    # Instantly docs indicate Bearer-token style auth.
-    # See `https://developer.instantly.ai/` (API V2 migration mentions Bearer token auth).
+    """
+    Instantly API auth can be configured as:
+    - Bearer token (Authorization: Bearer ...)
+    - ApiKeyAuth (commonly X-API-KEY: ...)
+    We don't log the key, and we may try both on 401/403.
+    """
+    # Default to ApiKeyAuth first because Bearer-only is currently returning 401 in your logs.
+    mode = (os.getenv("INSTANTLY_AUTH_MODE") or "x_api_key").strip().lower()
+    if mode in {"bearer", "authorization"}:
+        return {"Authorization": f"Bearer {INSTANTLY_API_KEY}"}
+    # Default / x_api_key
+    return {"X-API-KEY": INSTANTLY_API_KEY}
+
+
+def _instantly_alt_headers(primary: Dict[str, str]) -> Dict[str, str]:
+    # If primary is X-API-KEY, alternate is Bearer, and vice-versa.
+    if "Authorization" in primary:
+        return {"X-API-KEY": INSTANTLY_API_KEY}
     return {"Authorization": f"Bearer {INSTANTLY_API_KEY}"}
+
+
+async def _instantly_request_with_retry(
+    client: httpx.AsyncClient,
+    method: str,
+    url: str,
+    *,
+    json: Optional[Dict[str, Any]] = None,
+) -> httpx.Response:
+    """
+    Perform an Instantly API request.
+    - Tries primary auth header
+    - If 401/403, retries once with alternate auth header
+    """
+    primary = _instantly_headers()
+    r = await client.request(method, url, headers=primary, json=json)
+    if r.status_code in (401, 403):
+        alt = _instantly_alt_headers(primary)
+        r2 = await client.request(method, url, headers=alt, json=json)
+        return r2
+    return r
 
 
 async def _instantly_fetch_lead(lead_id: Optional[str], lead_email: Optional[str]) -> Optional[Dict[str, Any]]:
@@ -142,9 +175,10 @@ async def _instantly_fetch_lead(lead_id: Optional[str], lead_email: Optional[str
     timeout = httpx.Timeout(10.0, connect=5.0)
     async with httpx.AsyncClient(timeout=timeout) as client:
         if lead_id:
-            r = await client.get(
+            r = await _instantly_request_with_retry(
+                client,
+                "GET",
                 f"{INSTANTLY_API_BASE}/api/v2/lead/{lead_id}",
-                headers=_instantly_headers(),
             )
             r.raise_for_status()
             data = r.json()
@@ -152,9 +186,10 @@ async def _instantly_fetch_lead(lead_id: Optional[str], lead_email: Optional[str
 
         if lead_email:
             body = {"search": lead_email, "limit": 1}
-            r = await client.post(
+            r = await _instantly_request_with_retry(
+                client,
+                "POST",
                 f"{INSTANTLY_API_BASE}/api/v2/lead/list",
-                headers=_instantly_headers(),
                 json=body,
             )
             r.raise_for_status()
@@ -193,9 +228,10 @@ async def _instantly_get_esp_map() -> Dict[str, str]:
     timeout = httpx.Timeout(10.0, connect=5.0)
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
-            r = await client.get(
+            r = await _instantly_request_with_retry(
+                client,
+                "GET",
                 f"{INSTANTLY_API_BASE}/api/v2/inbox-placement-test/email-service-provider-option",
-                headers=_instantly_headers(),
             )
             r.raise_for_status()
             data = r.json()
@@ -248,67 +284,6 @@ def _safe_keys(payload: Dict[str, Any]) -> Dict[str, Any]:
         "campaign_name": payload.get("campaign_name") or payload.get("campaignName"),
     }
 
-def _trace_add(event: Dict[str, Any]) -> None:
-    try:
-        _TRACE_BUFFER.appendleft(event)
-    except Exception:
-        # Never break webhook due to debug tracing.
-        pass
-
-def _require_view_token(request: Request) -> None:
-    if not WEBHOOK_VIEW_TOKEN:
-        return
-    token = request.query_params.get("token") or ""
-    if token != WEBHOOK_VIEW_TOKEN:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-def _html_escape(s: str) -> str:
-    return (
-        s.replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-        .replace('"', "&quot;")
-        .replace("'", "&#39;")
-    )
-
-def _render_trace_page() -> str:
-    rows = []
-    for item in list(_TRACE_BUFFER):
-        trace_id = _html_escape(str(item.get("trace_id", "")))
-        ts = _html_escape(str(item.get("ts", "")))
-        summary = _html_escape(str(item.get("summary", "")))
-        rows.append(f"<tr><td><code>{trace_id}</code></td><td>{ts}</td><td>{summary}</td></tr>")
-
-    table_html = (
-        "<table>"
-        "<thead><tr><th>trace_id</th><th>time_utc</th><th>summary</th></tr></thead>"
-        f"<tbody>{''.join(rows) if rows else '<tr><td colspan=\"3\">No traces yet. Trigger a webhook.</td></tr>'}</tbody>"
-        "</table>"
-    )
-
-    return f"""<!doctype html>
-<html>
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Instantly → Airtable Webhook Debug</title>
-    <style>
-      body {{ font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 24px; }}
-      h1 {{ margin: 0 0 6px 0; font-size: 20px; }}
-      p {{ margin: 0 0 16px 0; color: #444; }}
-      table {{ border-collapse: collapse; width: 100%; }}
-      th, td {{ border: 1px solid #ddd; padding: 8px; vertical-align: top; }}
-      th {{ background: #f7f7f7; text-align: left; }}
-      code {{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New"; }}
-    </style>
-  </head>
-  <body>
-    <h1>Webhook Debug (last {len(_TRACE_BUFFER)} traces)</h1>
-    <p>This is an in-memory buffer (serverless). If the instance restarts, history resets.</p>
-    {table_html}
-  </body>
-</html>"""
-
 
 def _parse_payload(payload: Dict[str, Any]) -> Dict[str, Optional[str]]:
     # Standard fields (flat payload)
@@ -347,36 +322,21 @@ def health() -> Dict[str, str]:
     # Do not force env validation here; useful for basic uptime checks.
     return {"status": "ok"}
 
-@app.get("/webhook/instantly")
-async def instantly_webhook_debug_page(request: Request):
-    """
-    Human-friendly debug page for recent webhook calls.
-    Note: in-memory only; for durable logs, use Vercel logs or send logs to Airtable.
-    """
-    _require_view_token(request)
-    from fastapi.responses import HTMLResponse
-
-    return HTMLResponse(content=_render_trace_page(), status_code=200)
-
 
 @app.post("/webhook/instantly")
 async def instantly_webhook(request: Request) -> JSONResponse:
     trace_id = uuid.uuid4().hex
-    ts = _iso_utc_now_z()
     try:
         payload = await request.json()
     except Exception as e:
         logger.warning("trace_id=%s invalid_json error=%s", trace_id, str(e))
-        _trace_add({"trace_id": trace_id, "ts": ts, "summary": f"Invalid JSON: {e}"})
         raise HTTPException(status_code=400, detail=f"Invalid JSON payload: {e}")
 
     if not isinstance(payload, dict):
         logger.warning("trace_id=%s payload_not_object type=%s", trace_id, type(payload).__name__)
-        _trace_add({"trace_id": trace_id, "ts": ts, "summary": f"Payload not object: {type(payload).__name__}"})
         raise HTTPException(status_code=400, detail="Payload must be a JSON object")
 
     logger.info("trace_id=%s webhook_received %s", trace_id, _safe_keys(payload))
-    _trace_add({"trace_id": trace_id, "ts": ts, "summary": f"Received webhook: {_safe_keys(payload)}"})
 
     parsed = _parse_payload(payload)
     lead_id = parsed["lead_id"]
@@ -384,7 +344,6 @@ async def instantly_webhook(request: Request) -> JSONResponse:
     if not lead_id and not lead_email:
         # Instantly may send events without a lead_id; for those, we fall back to email if provided.
         logger.info("trace_id=%s skipped reason=missing_lead_id_and_email", trace_id)
-        _trace_add({"trace_id": trace_id, "ts": ts, "summary": "Skipped: missing lead_id and lead_email"})
         return JSONResponse(
             status_code=200,
             content={"message": "Skipped: Missing lead_id and lead_email in webhook payload", "trace_id": trace_id},
@@ -409,7 +368,6 @@ async def instantly_webhook(request: Request) -> JSONResponse:
         (lead_id[:12] + "...") if lead_id else None,
         lead_email,
     )
-    _trace_add({"trace_id": trace_id, "ts": ts, "summary": f"Airtable search mode={search_mode} lead_email={lead_email}"})
 
     matches = table.all(
         formula=formula,
@@ -418,7 +376,6 @@ async def instantly_webhook(request: Request) -> JSONResponse:
 
     if not matches:
         logger.info("trace_id=%s airtable_not_found mode=%s", trace_id, search_mode)
-        _trace_add({"trace_id": trace_id, "ts": ts, "summary": f"Skipped: Airtable not found by {search_mode}"})
         return JSONResponse(
             status_code=200,
             content={"message": f"Skipped: Record not found in Airtable by {search_mode}", "trace_id": trace_id},
@@ -434,13 +391,6 @@ async def instantly_webhook(request: Request) -> JSONResponse:
         record_id,
         _is_blank(fields.get(PROV_COL)),
         _is_blank(fields.get(GATE_COL)),
-    )
-    _trace_add(
-        {
-            "trace_id": trace_id,
-            "ts": ts,
-            "summary": f"Airtable found record_id={record_id} provider_blank={_is_blank(fields.get(PROV_COL))} gateway_blank={_is_blank(fields.get(GATE_COL))}",
-        }
     )
 
     # Prepare update fields (always send all mapped fields; don't wipe existing on missing webhook keys)
@@ -466,18 +416,10 @@ async def instantly_webhook(request: Request) -> JSONResponse:
         not _is_blank(email_provider),
         not _is_blank(email_security_gateway),
     )
-    _trace_add(
-        {
-            "trace_id": trace_id,
-            "ts": ts,
-            "summary": f"Enrich decision need_provider={need_provider} need_gateway={need_gateway}",
-        }
-    )
 
     if need_provider or need_gateway:
         try:
             logger.info("trace_id=%s instantly_fetch_start", trace_id)
-            _trace_add({"trace_id": trace_id, "ts": ts, "summary": "Instantly fetch start"})
             lead_obj = await _instantly_fetch_lead(lead_id=lead_id, lead_email=lead_email)
             if lead_obj:
                 esp_code, esg_code = _extract_esp_esg_codes(lead_obj)
@@ -487,26 +429,21 @@ async def instantly_webhook(request: Request) -> JSONResponse:
                     esp_code,
                     esg_code,
                 )
-                _trace_add({"trace_id": trace_id, "ts": ts, "summary": f"Instantly fetched esp_code={esp_code} esg_code={esg_code}"})
 
                 if need_provider and esp_code:
                     esp_map = await _instantly_get_esp_map()
                     email_provider = esp_map.get(esp_code) or esp_code
                     logger.info("trace_id=%s provider_filled value=%s", trace_id, email_provider)
-                    _trace_add({"trace_id": trace_id, "ts": ts, "summary": f"Provider filled: {email_provider}"})
 
                 if need_gateway and esg_code:
                     # No known public mapping endpoint for ESG in docs; store the code as-is.
                     email_security_gateway = esg_code
                     logger.info("trace_id=%s gateway_filled value=%s", trace_id, email_security_gateway)
-                    _trace_add({"trace_id": trace_id, "ts": ts, "summary": f"Gateway filled: {email_security_gateway}"})
             else:
                 logger.info("trace_id=%s instantly_fetch_empty", trace_id)
-                _trace_add({"trace_id": trace_id, "ts": ts, "summary": "Instantly fetch returned no lead"})
         except Exception:
             # Never fail the webhook because Instantly enrichment is unavailable.
             logger.exception("trace_id=%s instantly_fetch_failed", trace_id)
-            _trace_add({"trace_id": trace_id, "ts": ts, "summary": "Instantly fetch failed (see server logs)"})
             pass
 
     update_fields: Dict[str, Any] = {
@@ -533,11 +470,9 @@ async def instantly_webhook(request: Request) -> JSONResponse:
         )
         table.update(record_id, update_fields)
         logger.info("trace_id=%s airtable_update_ok record_id=%s", trace_id, record_id)
-        _trace_add({"trace_id": trace_id, "ts": ts, "summary": f"Airtable updated provider={update_fields.get(PROV_COL)} gateway={update_fields.get(GATE_COL)}"})
     except Exception as e:
         # Return a clear error so the failure is diagnosable in Vercel logs.
         logger.exception("trace_id=%s airtable_update_failed record_id=%s", trace_id, record_id)
-        _trace_add({"trace_id": trace_id, "ts": ts, "summary": f"Airtable update failed: {e}"})
         raise HTTPException(status_code=500, detail=f"Airtable update failed: {e}")
 
     response: Dict[str, Any] = {"message": "Success: Record enriched and updated", "trace_id": trace_id}
