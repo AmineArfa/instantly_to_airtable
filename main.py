@@ -20,6 +20,7 @@ TABLE_NAME = "tblHBBta5IyXclFln"
 
 # Airtable field mapping (Exact Columns)
 ID_COL = "instantly_lead_id"  # Search key
+EMAIL_COL = "key_contact_email"  # Fallback search key when lead_id is missing
 STATUS_COL = "status"
 LOG_COL = "communication_log"
 DATE_COL = "last_interaction_date"
@@ -96,6 +97,7 @@ def _parse_payload(payload: Dict[str, Any]) -> Dict[str, Optional[str]]:
     # Note: Instantly payloads vary by event type; we accept common aliases but remain
     # strict about ONLY updating Airtable when we have a real lead_id.
     lead_id = payload.get("lead_id") or payload.get("leadId")
+    lead_email = payload.get("lead_email") or payload.get("email") or payload.get("leadEmail")
     reply_text = payload.get("reply_text") or payload.get("replyText") or payload.get("reply") or payload.get("message")
     lead_status = (
         payload.get("lead_status")
@@ -112,6 +114,7 @@ def _parse_payload(payload: Dict[str, Any]) -> Dict[str, Optional[str]]:
 
     return {
         "lead_id": str(lead_id).strip() if lead_id is not None else None,
+        "lead_email": str(lead_email).strip() if lead_email is not None else None,
         "reply_text": str(reply_text) if reply_text is not None else None,
         "lead_status": str(lead_status) if lead_status is not None else None,
         "campaign_name": str(campaign_name) if campaign_name is not None else None,
@@ -139,24 +142,36 @@ async def instantly_webhook(request: Request) -> JSONResponse:
 
     parsed = _parse_payload(payload)
     lead_id = parsed["lead_id"]
-    if not lead_id:
-        # Instantly may send events (e.g. lead_interested) without a lead_id.
-        # We must remain strict about only updating by instantly_lead_id, so we skip.
+    lead_email = parsed.get("lead_email")
+    if not lead_id and not lead_email:
+        # Instantly may send events without a lead_id; for those, we fall back to email if provided.
         return JSONResponse(
             status_code=200,
-            content={
-                "message": "Skipped: Missing lead_id in webhook payload (strict ID-only mode)",
-            },
+            content={"message": "Skipped: Missing lead_id and lead_email in webhook payload"},
         )
 
     table = _airtable_table()
 
-    # Step 1: Strict ID search
-    formula = f'{{{ID_COL}}} = "{_escape_airtable_string(lead_id)}"'
-    matches = table.all(formula=formula, fields=[ID_COL, STATUS_COL, LOG_COL, CAMP_COL, PROV_COL, GATE_COL])
+    # Step 1: Strict search
+    # - Prefer instantly_lead_id when present
+    # - Fall back to key_contact_email when lead_id is missing
+    if lead_id:
+        formula = f'{{{ID_COL}}} = "{_escape_airtable_string(lead_id)}"'
+        search_mode = "instantly_lead_id"
+    else:
+        formula = f'{{{EMAIL_COL}}} = "{_escape_airtable_string(lead_email or "")}"'
+        search_mode = "key_contact_email"
+
+    matches = table.all(
+        formula=formula,
+        fields=[ID_COL, EMAIL_COL, STATUS_COL, LOG_COL, CAMP_COL, PROV_COL, GATE_COL],
+    )
 
     if not matches:
-        return JSONResponse(status_code=200, content={"message": "Skipped: ID not found in Airtable"})
+        return JSONResponse(
+            status_code=200,
+            content={"message": f"Skipped: Record not found in Airtable by {search_mode}"},
+        )
 
     record = matches[0]
     record_id = record["id"]
