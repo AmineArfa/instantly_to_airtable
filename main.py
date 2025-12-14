@@ -1,4 +1,6 @@
+import logging
 import os
+import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple
 
@@ -6,6 +8,12 @@ import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pyairtable import Table
+
+
+# Logging
+LOG_LEVEL = (os.getenv("LOG_LEVEL") or "INFO").upper()
+logging.basicConfig(level=LOG_LEVEL)
+logger = logging.getLogger("instantly_to_airtable")
 
 
 # Airtable configuration
@@ -23,6 +31,7 @@ TABLE_NAME = "tblHBBta5IyXclFln"
 # Keep Instantly key in env (secret)
 INSTANTLY_API_KEY = os.getenv("INSTANTLY_API_KEY", "").strip()
 INSTANTLY_API_BASE = (os.getenv("INSTANTLY_API_BASE") or "https://api.instantly.ai").strip().rstrip("/")
+WEBHOOK_DEBUG = (os.getenv("WEBHOOK_DEBUG") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
 
 # Airtable field mapping (Exact Columns)
 ID_COL = "instantly_lead_id"  # Search key
@@ -222,6 +231,20 @@ async def _instantly_get_esp_map() -> Dict[str, str]:
         return {}
 
 
+def _safe_keys(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Return a small, safe-to-log subset of payload info.
+    Never log secrets; only log key presence + a few identifiers.
+    """
+    return {
+        "keys": sorted(list(payload.keys()))[:60],
+        "event_type": payload.get("event_type") or payload.get("type"),
+        "lead_id_present": bool(payload.get("lead_id") or payload.get("leadId")),
+        "lead_email_present": bool(payload.get("lead_email") or payload.get("email") or payload.get("leadEmail")),
+        "campaign_name": payload.get("campaign_name") or payload.get("campaignName"),
+    }
+
+
 def _parse_payload(payload: Dict[str, Any]) -> Dict[str, Optional[str]]:
     # Standard fields (flat payload)
     # Note: Instantly payloads vary by event type; we accept common aliases but remain
@@ -262,22 +285,28 @@ def health() -> Dict[str, str]:
 
 @app.post("/webhook/instantly")
 async def instantly_webhook(request: Request) -> JSONResponse:
+    trace_id = uuid.uuid4().hex
     try:
         payload = await request.json()
     except Exception as e:
+        logger.warning("trace_id=%s invalid_json error=%s", trace_id, str(e))
         raise HTTPException(status_code=400, detail=f"Invalid JSON payload: {e}")
 
     if not isinstance(payload, dict):
+        logger.warning("trace_id=%s payload_not_object type=%s", trace_id, type(payload).__name__)
         raise HTTPException(status_code=400, detail="Payload must be a JSON object")
+
+    logger.info("trace_id=%s webhook_received %s", trace_id, _safe_keys(payload))
 
     parsed = _parse_payload(payload)
     lead_id = parsed["lead_id"]
     lead_email = parsed.get("lead_email")
     if not lead_id and not lead_email:
         # Instantly may send events without a lead_id; for those, we fall back to email if provided.
+        logger.info("trace_id=%s skipped reason=missing_lead_id_and_email", trace_id)
         return JSONResponse(
             status_code=200,
-            content={"message": "Skipped: Missing lead_id and lead_email in webhook payload"},
+            content={"message": "Skipped: Missing lead_id and lead_email in webhook payload", "trace_id": trace_id},
         )
 
     table = _airtable_table()
@@ -292,20 +321,37 @@ async def instantly_webhook(request: Request) -> JSONResponse:
         formula = f'{{{EMAIL_COL}}} = "{_escape_airtable_string(lead_email or "")}"'
         search_mode = "key_contact_email"
 
+    logger.info(
+        "trace_id=%s airtable_search mode=%s lead_id=%s lead_email=%s",
+        trace_id,
+        search_mode,
+        (lead_id[:12] + "...") if lead_id else None,
+        lead_email,
+    )
+
     matches = table.all(
         formula=formula,
         fields=[ID_COL, EMAIL_COL, STATUS_COL, LOG_COL, CAMP_COL, PROV_COL, GATE_COL],
     )
 
     if not matches:
+        logger.info("trace_id=%s airtable_not_found mode=%s", trace_id, search_mode)
         return JSONResponse(
             status_code=200,
-            content={"message": f"Skipped: Record not found in Airtable by {search_mode}"},
+            content={"message": f"Skipped: Record not found in Airtable by {search_mode}", "trace_id": trace_id},
         )
 
     record = matches[0]
     record_id = record["id"]
     fields: Dict[str, Any] = record.get("fields", {}) or {}
+
+    logger.info(
+        "trace_id=%s airtable_found record_id=%s existing_provider_blank=%s existing_gateway_blank=%s",
+        trace_id,
+        record_id,
+        _is_blank(fields.get(PROV_COL)),
+        _is_blank(fields.get(GATE_COL)),
+    )
 
     # Prepare update fields (always send all mapped fields; don't wipe existing on missing webhook keys)
     lead_status = parsed["lead_status"]
@@ -322,21 +368,42 @@ async def instantly_webhook(request: Request) -> JSONResponse:
     need_provider = provider_missing and _is_blank(email_provider)
     need_gateway = gateway_missing and _is_blank(email_security_gateway)
 
+    logger.info(
+        "trace_id=%s enrich_decision need_provider=%s need_gateway=%s webhook_provider_present=%s webhook_gateway_present=%s",
+        trace_id,
+        need_provider,
+        need_gateway,
+        not _is_blank(email_provider),
+        not _is_blank(email_security_gateway),
+    )
+
     if need_provider or need_gateway:
         try:
+            logger.info("trace_id=%s instantly_fetch_start", trace_id)
             lead_obj = await _instantly_fetch_lead(lead_id=lead_id, lead_email=lead_email)
             if lead_obj:
                 esp_code, esg_code = _extract_esp_esg_codes(lead_obj)
+                logger.info(
+                    "trace_id=%s instantly_fetch_ok esp_code=%s esg_code=%s",
+                    trace_id,
+                    esp_code,
+                    esg_code,
+                )
 
                 if need_provider and esp_code:
                     esp_map = await _instantly_get_esp_map()
                     email_provider = esp_map.get(esp_code) or esp_code
+                    logger.info("trace_id=%s provider_filled value=%s", trace_id, email_provider)
 
                 if need_gateway and esg_code:
                     # No known public mapping endpoint for ESG in docs; store the code as-is.
                     email_security_gateway = esg_code
+                    logger.info("trace_id=%s gateway_filled value=%s", trace_id, email_security_gateway)
+            else:
+                logger.info("trace_id=%s instantly_fetch_empty", trace_id)
         except Exception:
             # Never fail the webhook because Instantly enrichment is unavailable.
+            logger.exception("trace_id=%s instantly_fetch_failed", trace_id)
             pass
 
     update_fields: Dict[str, Any] = {
@@ -354,11 +421,30 @@ async def instantly_webhook(request: Request) -> JSONResponse:
     update_fields[LOG_COL] = new_log
 
     try:
+        logger.info(
+            "trace_id=%s airtable_update_start record_id=%s provider=%s gateway=%s",
+            trace_id,
+            record_id,
+            update_fields.get(PROV_COL),
+            update_fields.get(GATE_COL),
+        )
         table.update(record_id, update_fields)
+        logger.info("trace_id=%s airtable_update_ok record_id=%s", trace_id, record_id)
     except Exception as e:
         # Return a clear error so the failure is diagnosable in Vercel logs.
+        logger.exception("trace_id=%s airtable_update_failed record_id=%s", trace_id, record_id)
         raise HTTPException(status_code=500, detail=f"Airtable update failed: {e}")
 
-    return JSONResponse(status_code=200, content={"message": "Success: Record enriched and updated"})
+    response: Dict[str, Any] = {"message": "Success: Record enriched and updated", "trace_id": trace_id}
+    if WEBHOOK_DEBUG:
+        response["debug"] = {
+            "search_mode": search_mode,
+            "provider_was_blank": provider_missing,
+            "gateway_was_blank": gateway_missing,
+            "provider_filled_now": not _is_blank(update_fields.get(PROV_COL)),
+            "gateway_filled_now": not _is_blank(update_fields.get(GATE_COL)),
+            "instantly_enrichment_attempted": bool(need_provider or need_gateway),
+        }
+    return JSONResponse(status_code=200, content=response)
 
 
