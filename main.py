@@ -211,7 +211,7 @@ async def _instantly_request_with_retry(
 
 async def _instantly_fetch_lead(lead_id: Optional[str], lead_email: Optional[str]) -> Optional[Dict[str, Any]]:
     """
-    Fetch a lead from Instantly.
+    Fetch a lead from Instantly. YES
     - Prefer GET /api/v2/lead/{id}
     - Else POST /api/v2/lead/list with search=email (returns items[])
     """
