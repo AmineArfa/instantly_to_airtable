@@ -1,7 +1,8 @@
 import os
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
+import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pyairtable import Table
@@ -18,6 +19,11 @@ AIRTABLE_API_KEY = os.getenv("AIRTABLE_API_KEY", "").strip()
 BASE_ID = "appoaTzHT7BYJcXOb"
 TABLE_NAME = "tblHBBta5IyXclFln"
 
+# Instantly configuration
+# Keep Instantly key in env (secret)
+INSTANTLY_API_KEY = os.getenv("INSTANTLY_API_KEY", "").strip()
+INSTANTLY_API_BASE = (os.getenv("INSTANTLY_API_BASE") or "https://api.instantly.ai").strip().rstrip("/")
+
 # Airtable field mapping (Exact Columns)
 ID_COL = "instantly_lead_id"  # Search key
 EMAIL_COL = "key_contact_email"  # Fallback search key when lead_id is missing
@@ -30,6 +36,11 @@ GATE_COL = "email_security_gateway"
 
 
 app = FastAPI(title="Instantly.ai → Airtable Webhook Bridge")
+
+# Cache for ESP code -> label mapping (best-effort)
+_ESP_MAP_CACHE: Dict[str, str] = {}
+_ESP_MAP_CACHE_TS: Optional[datetime] = None
+_ESP_MAP_CACHE_TTL_SECONDS = 6 * 60 * 60  # 6 hours
 
 
 def _require_env() -> None:
@@ -90,6 +101,125 @@ def _coalesce_nonempty(new_value: Optional[Any], existing_value: Optional[Any]) 
     if isinstance(new_value, str) and new_value.strip() == "":
         return existing_value
     return new_value
+
+
+def _is_blank(value: Optional[Any]) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str) and value.strip() == "":
+        return True
+    return False
+
+
+def _instantly_headers() -> Dict[str, str]:
+    # Instantly docs indicate Bearer-token style auth.
+    # See `https://developer.instantly.ai/` (API V2 migration mentions Bearer token auth).
+    return {"Authorization": f"Bearer {INSTANTLY_API_KEY}"}
+
+
+async def _instantly_fetch_lead(lead_id: Optional[str], lead_email: Optional[str]) -> Optional[Dict[str, Any]]:
+    """
+    Fetch a lead from Instantly.
+    - Prefer GET /api/v2/lead/{id}
+    - Else POST /api/v2/lead/list with search=email (returns items[])
+    """
+    if not INSTANTLY_API_KEY:
+        return None
+
+    timeout = httpx.Timeout(10.0, connect=5.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        if lead_id:
+            r = await client.get(
+                f"{INSTANTLY_API_BASE}/api/v2/lead/{lead_id}",
+                headers=_instantly_headers(),
+            )
+            r.raise_for_status()
+            data = r.json()
+            return data if isinstance(data, dict) else None
+
+        if lead_email:
+            body = {"search": lead_email, "limit": 1}
+            r = await client.post(
+                f"{INSTANTLY_API_BASE}/api/v2/lead/list",
+                headers=_instantly_headers(),
+                json=body,
+            )
+            r.raise_for_status()
+            data = r.json()
+            if isinstance(data, dict):
+                items = data.get("items")
+                if isinstance(items, list) and items and isinstance(items[0], dict):
+                    return items[0]
+            return None
+
+    return None
+
+
+def _extract_esp_esg_codes(lead_obj: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+    esp = lead_obj.get("esp_code")
+    esg = lead_obj.get("esg_code")
+    esp_code = str(esp).strip() if esp is not None else None
+    esg_code = str(esg).strip() if esg is not None else None
+    return (esp_code or None, esg_code or None)
+
+
+async def _instantly_get_esp_map() -> Dict[str, str]:
+    """
+    Best-effort mapping of esp_code -> provider name.
+    Uses GET /api/v2/inbox-placement-test/email-service-provider-option when available.
+    """
+    global _ESP_MAP_CACHE_TS, _ESP_MAP_CACHE
+
+    now = datetime.now(timezone.utc)
+    if _ESP_MAP_CACHE_TS and (now - _ESP_MAP_CACHE_TS).total_seconds() < _ESP_MAP_CACHE_TTL_SECONDS:
+        return _ESP_MAP_CACHE
+
+    if not INSTANTLY_API_KEY:
+        return {}
+
+    timeout = httpx.Timeout(10.0, connect=5.0)
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            r = await client.get(
+                f"{INSTANTLY_API_BASE}/api/v2/inbox-placement-test/email-service-provider-option",
+                headers=_instantly_headers(),
+            )
+            r.raise_for_status()
+            data = r.json()
+
+        mapping: Dict[str, str] = {}
+
+        # Common shapes (best-effort):
+        # - list[{"code": "...", "name"/"label": "..."}]
+        # - {"esp": [...]} or {"items": [...]}
+        candidates = None
+        if isinstance(data, list):
+            candidates = data
+        elif isinstance(data, dict):
+            if isinstance(data.get("esp"), list):
+                candidates = data["esp"]
+            elif isinstance(data.get("items"), list):
+                candidates = data["items"]
+
+        if isinstance(candidates, list):
+            for item in candidates:
+                if not isinstance(item, dict):
+                    continue
+                code = item.get("code") or item.get("value") or item.get("id")
+                name = item.get("name") or item.get("label") or item.get("title")
+                if code is None or name is None:
+                    continue
+                code_s = str(code).strip()
+                name_s = str(name).strip()
+                if code_s and name_s:
+                    mapping[code_s] = name_s
+
+        _ESP_MAP_CACHE = mapping
+        _ESP_MAP_CACHE_TS = now
+        return mapping
+    except Exception:
+        # If anything goes wrong, just don't map (we'll write esp_code as-is).
+        return {}
 
 
 def _parse_payload(payload: Dict[str, Any]) -> Dict[str, Optional[str]]:
@@ -184,6 +314,30 @@ async def instantly_webhook(request: Request) -> JSONResponse:
     email_security_gateway = parsed["email_security_gateway"]
     reply_text = parsed["reply_text"] or ""
     event_ts_iso = _iso_from_payload_timestamp(parsed.get("event_timestamp")) or _iso_utc_now_z()
+
+    # If Airtable provider/gateway are empty AND webhook didn't provide them,
+    # try fetching from Instantly after the webhook is called.
+    provider_missing = _is_blank(fields.get(PROV_COL))
+    gateway_missing = _is_blank(fields.get(GATE_COL))
+    need_provider = provider_missing and _is_blank(email_provider)
+    need_gateway = gateway_missing and _is_blank(email_security_gateway)
+
+    if need_provider or need_gateway:
+        try:
+            lead_obj = await _instantly_fetch_lead(lead_id=lead_id, lead_email=lead_email)
+            if lead_obj:
+                esp_code, esg_code = _extract_esp_esg_codes(lead_obj)
+
+                if need_provider and esp_code:
+                    esp_map = await _instantly_get_esp_map()
+                    email_provider = esp_map.get(esp_code) or esp_code
+
+                if need_gateway and esg_code:
+                    # No known public mapping endpoint for ESG in docs; store the code as-is.
+                    email_security_gateway = esg_code
+        except Exception:
+            # Never fail the webhook because Instantly enrichment is unavailable.
+            pass
 
     update_fields: Dict[str, Any] = {
         STATUS_COL: _coalesce_nonempty(lead_status, fields.get(STATUS_COL)),
