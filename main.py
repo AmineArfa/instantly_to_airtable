@@ -377,6 +377,16 @@ def _parse_payload(payload: Dict[str, Any]) -> Dict[str, Optional[str]]:
     }
 
 
+@app.get("/")
+def root() -> Dict[str, str]:
+    """Root endpoint so Vercel health-checks / browser visits don't 404."""
+    return {
+        "app": "Instantly.ai → Airtable Webhook Bridge",
+        "status": "ok",
+        "endpoints": "POST /webhook/instantly, POST /webhook/trigger-visit, GET /health",
+    }
+
+
 @app.get("/health")
 def health() -> Dict[str, str]:
     # Do not force env validation here; useful for basic uptime checks.
