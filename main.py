@@ -601,7 +601,11 @@ async def instantly_webhook(request: Request) -> JSONResponse:
 def _master_airtable_table() -> Table:
     """Return a pyairtable Table pointing at the Master Leads database."""
     _require_env()
-    return Table(AIRTABLE_API_KEY, MASTER_BASE_ID, MASTER_TABLE_ID)
+    # Hardcode locally to avoid any accidental env/global swap.
+    base_id = "appryC1C0nL74fS1H"
+    table_id = "tblKrC9hOxCuMMyZT"
+    logger.info(f"Connecting to Airtable - Base: {base_id}, Table: {table_id}")
+    return Table(AIRTABLE_API_KEY, base_id, table_id)
 
 
 @app.post("/webhook/trigger-visit")
