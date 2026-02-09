@@ -7,7 +7,9 @@ from typing import Any, Dict, Optional, Tuple
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 from pyairtable import Table
 
 
@@ -35,6 +37,10 @@ INSTANTLY_API_BASE = (os.getenv("INSTANTLY_API_BASE") or "https://api.instantly.
 WEBHOOK_DEBUG = (os.getenv("WEBHOOK_DEBUG") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
 WEBHOOK_VIEW_TOKEN = (os.getenv("WEBHOOK_VIEW_TOKEN") or "").strip()
 
+# Master Airtable Database (used by /webhook/trigger-visit)
+MASTER_BASE_ID = "appryC1C0nL74fS1H"
+MASTER_TABLE_ID = "tblKrC9hOxCuMMyZT"
+
 # Airtable field mapping (Exact Columns)
 ID_COL = "instantly_lead_id"  # Search key
 EMAIL_COL = "key_contact_email"  # Fallback search key when lead_id is missing
@@ -46,7 +52,19 @@ PROV_COL = "email_provider"
 GATE_COL = "email_security_gateway"
 
 
+class TriggerVisitRequest(BaseModel):
+    email: str
+
+
 app = FastAPI(title="Instantly.ai → Airtable Webhook Bridge")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Cache for ESP code -> label mapping (best-effort)
 _ESP_MAP_CACHE: Dict[str, str] = {}
@@ -574,3 +592,129 @@ async def instantly_webhook(request: Request) -> JSONResponse:
     return JSONResponse(status_code=200, content=response)
 
 
+def _master_airtable_table() -> Table:
+    """Return a pyairtable Table pointing at the Master Leads database."""
+    _require_env()
+    return Table(AIRTABLE_API_KEY, MASTER_BASE_ID, MASTER_TABLE_ID)
+
+
+@app.post("/webhook/trigger-visit")
+async def trigger_visit(body: TriggerVisitRequest) -> JSONResponse:
+    """
+    Closed-loop tracking endpoint.
+
+    Receives an email address from the frontend website, verifies it
+    exists in the Master Airtable Database, then pushes a status update
+    to Instantly so we can track when a lead visits the website.
+    """
+    email = body.email.strip()
+    if not email:
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "reason": "empty_email"},
+        )
+
+    logger.info("trigger_visit email=%s", email)
+
+    # --- Step 1: Look up the email in the Master Airtable Database ---
+    table = _master_airtable_table()
+
+    escaped_email = _escape_airtable_string(email)
+    formula = f'LOWER({{{EMAIL_COL}}}) = LOWER("{escaped_email}")'
+
+    try:
+        matches = table.all(
+            formula=formula,
+            fields=[EMAIL_COL, ID_COL, "instantly_campaign_id"],
+        )
+    except Exception as e:
+        logger.exception("trigger_visit airtable_search_failed email=%s", email)
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "reason": f"airtable_search_failed: {e}"},
+        )
+
+    # --- Step 2: Verification ---
+    if not matches:
+        logger.info("trigger_visit email_not_found email=%s", email)
+        return JSONResponse(
+            status_code=200,
+            content={"status": "ignored", "reason": "email_not_found"},
+        )
+
+    record = matches[0]
+    fields: Dict[str, Any] = record.get("fields", {}) or {}
+
+    instantly_lead_id = fields.get(ID_COL)
+    instantly_campaign_id = fields.get("instantly_campaign_id")
+
+    # --- Step 3: Sync check ---
+    if _is_blank(instantly_lead_id) or _is_blank(instantly_campaign_id):
+        logger.info(
+            "trigger_visit not_synced email=%s lead_id=%s campaign_id=%s",
+            email,
+            instantly_lead_id,
+            instantly_campaign_id,
+        )
+        return JSONResponse(
+            status_code=200,
+            content={"status": "ignored", "reason": "not_synced"},
+        )
+
+    # --- Step 4: Update Instantly lead status ---
+    api_key = os.getenv("INSTANTLY_API_KEY", "").strip()
+    if not api_key:
+        logger.error("trigger_visit missing INSTANTLY_API_KEY")
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "reason": "missing_instantly_api_key"},
+        )
+
+    instantly_payload = {
+        "api_key": api_key,
+        "campaign_id": instantly_campaign_id,
+        "email": email,
+        "new_status": "Run Scan (website visit)",
+    }
+
+    timeout = httpx.Timeout(10.0, connect=5.0)
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.post(
+                "https://api.instantly.ai/api/v1/lead/update/status",
+                headers={"Content-Type": "application/json"},
+                json=instantly_payload,
+            )
+
+        if resp.status_code >= 400:
+            logger.warning(
+                "trigger_visit instantly_update_failed status=%s body=%s",
+                resp.status_code,
+                resp.text[:300],
+            )
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "status": "error",
+                    "reason": "instantly_update_failed",
+                    "instantly_status": resp.status_code,
+                    "instantly_body": resp.text[:300],
+                },
+            )
+
+        logger.info("trigger_visit instantly_update_ok email=%s", email)
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": "success",
+                "email": email,
+                "new_status": "Run Scan (website visit)",
+            },
+        )
+
+    except Exception as e:
+        logger.exception("trigger_visit instantly_request_failed email=%s", email)
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "reason": f"instantly_request_failed: {e}"},
+        )
