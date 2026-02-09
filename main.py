@@ -38,7 +38,7 @@ WEBHOOK_DEBUG = (os.getenv("WEBHOOK_DEBUG") or "").strip().lower() in {"1", "tru
 WEBHOOK_VIEW_TOKEN = (os.getenv("WEBHOOK_VIEW_TOKEN") or "").strip()
 
 # Master Airtable Database (used by /webhook/trigger-visit)
-MASTER_BASE_ID = "appryC1C0nL74fS1H"
+MASTER_BASE_ID = os.getenv("MASTER_BASE_ID", "").strip()
 MASTER_TABLE_ID = "tblKrC9hOxCuMMyZT"
 
 # Airtable field mapping (Exact Columns)
