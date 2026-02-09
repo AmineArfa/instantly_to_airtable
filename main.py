@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import uuid
@@ -9,7 +10,6 @@ import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
 from pyairtable import Table
 
 
@@ -50,10 +50,6 @@ DATE_COL = "last_interaction_date"
 CAMP_COL = "last_campaign_name"
 PROV_COL = "email_provider"
 GATE_COL = "email_security_gateway"
-
-
-class TriggerVisitRequest(BaseModel):
-    email: str
 
 
 app = FastAPI(title="Instantly.ai → Airtable Webhook Bridge")
@@ -599,15 +595,33 @@ def _master_airtable_table() -> Table:
 
 
 @app.post("/webhook/trigger-visit")
-async def trigger_visit(body: TriggerVisitRequest) -> JSONResponse:
+async def trigger_visit(request: Request) -> JSONResponse:
     """
-    Closed-loop tracking endpoint.
+    Closed-loop tracking endpoint (fire-and-forget from the frontend).
 
-    Receives an email address from the frontend website, verifies it
-    exists in the Master Airtable Database, then pushes a status update
-    to Instantly so we can track when a lead visits the website.
+    Accepts both ``application/json`` and ``text/plain`` Content-Type
+    because the frontend uses ``navigator.sendBeacon`` which sends
+    ``text/plain``.  The body is always a JSON-formatted string like
+    ``{"email": "user@example.com"}``.
     """
-    email = body.email.strip()
+    # --- Parse the raw body manually (handles text/plain + application/json) ---
+    try:
+        raw_body = await request.body()
+        data = json.loads(raw_body)
+    except Exception:
+        logger.warning("trigger_visit bad_body content_type=%s", request.headers.get("content-type"))
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "reason": "invalid_json_body"},
+        )
+
+    if not isinstance(data, dict):
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "reason": "expected_json_object"},
+        )
+
+    email = (data.get("email") or "").strip()
     if not email:
         return JSONResponse(
             status_code=400,
