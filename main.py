@@ -66,6 +66,7 @@ app.add_middleware(
 _ESP_MAP_CACHE: Dict[str, str] = {}
 _ESP_MAP_CACHE_TS: Optional[datetime] = None
 _ESP_MAP_CACHE_TTL_SECONDS = 6 * 60 * 60  # 6 hours
+_STATUS_ID_CACHE = {}
 
 _TRACE_BUFFER: "deque[Dict[str, Any]]" = deque(maxlen=50)
 
@@ -329,6 +330,62 @@ async def _instantly_get_esp_map() -> Dict[str, str]:
     except Exception:
         # If anything goes wrong, just don't map (we'll write esp_code as-is).
         return {}
+
+
+async def _get_instantly_status_id(target_label: str) -> Optional[int]:
+    normalized_target = (target_label or "").strip().lower()
+    if not normalized_target:
+        return None
+
+    cached = _STATUS_ID_CACHE.get(normalized_target)
+    if isinstance(cached, int):
+        return cached
+
+    if not INSTANTLY_API_KEY:
+        logger.warning("instantly_status_lookup_skipped missing_api_key")
+        return None
+
+    timeout = httpx.Timeout(10.0, connect=5.0)
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await _instantly_request_with_retry(
+                client,
+                "GET",
+                f"{INSTANTLY_API_BASE}/api/v2/lead-labels",
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+        items = data.get("items") if isinstance(data, dict) else None
+        if isinstance(items, list):
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                label = item.get("label")
+                if not isinstance(label, str):
+                    continue
+                if label.strip().lower() != normalized_target:
+                    continue
+
+                status_value = item.get("interest_status")
+                try:
+                    status_id = int(status_value)
+                except (TypeError, ValueError):
+                    logger.warning(
+                        "instantly_status_label_invalid_interest_status target_label=%s raw_value=%s",
+                        target_label,
+                        status_value,
+                    )
+                    return None
+
+                _STATUS_ID_CACHE[normalized_target] = status_id
+                return status_id
+
+        logger.warning("instantly_status_label_not_found target_label=%s", target_label)
+        return None
+    except Exception:
+        logger.exception("instantly_status_lookup_failed target_label=%s", target_label)
+        return None
 
 
 def _safe_keys(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -696,12 +753,21 @@ async def trigger_visit(request: Request) -> JSONResponse:
             content={"status": "error", "reason": "missing_instantly_api_key"},
         )
 
+    TARGET_LABEL = "Run scan (website visit)"
+    status_id = await _get_instantly_status_id(TARGET_LABEL)
+    if status_id is None:
+        logger.error("Status label '%s' not found in Instantly", TARGET_LABEL)
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "reason": "instantly_status_label_not_found"},
+        )
+
     url = f"https://api.instantly.ai/api/v2/leads/{instantly_lead_id}"
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {api_key}",
     }
-    payload = {"interest_status": "Run Scan (website visit)"}
+    payload = {"lt_interest_status": status_id}
 
     timeout = httpx.Timeout(10.0, connect=5.0)
     try:
@@ -730,7 +796,7 @@ async def trigger_visit(request: Request) -> JSONResponse:
             content={
                 "status": "success",
                 "email": email,
-                "interest_status": "Run Scan (website visit)",
+                "interest_status": status_id,
             },
         )
 
