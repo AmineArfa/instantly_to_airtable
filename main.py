@@ -710,7 +710,7 @@ async def trigger_visit(request: Request) -> JSONResponse:
     try:
         matches = table.all(
             formula=formula,
-            fields=[EMAIL_COL, ID_COL],
+            fields=[EMAIL_COL, ID_COL, "instantly_campaign_id"],
         )
     except Exception as e:
         logger.exception("trigger_visit airtable_search_failed email=%s", email)
@@ -731,13 +731,15 @@ async def trigger_visit(request: Request) -> JSONResponse:
     fields: Dict[str, Any] = record.get("fields", {}) or {}
 
     instantly_lead_id = fields.get(ID_COL)
+    instantly_campaign_id = fields.get("instantly_campaign_id")
 
     # --- Step 3: Sync check ---
-    if _is_blank(instantly_lead_id):
+    if _is_blank(instantly_lead_id) or _is_blank(instantly_campaign_id):
         logger.info(
-            "trigger_visit not_synced email=%s lead_id=%s",
+            "trigger_visit not_synced email=%s lead_id=%s campaign_id=%s",
             email,
             instantly_lead_id,
+            instantly_campaign_id,
         )
         return JSONResponse(
             status_code=200,
@@ -762,17 +764,22 @@ async def trigger_visit(request: Request) -> JSONResponse:
             content={"status": "error", "reason": "instantly_status_label_not_found"},
         )
 
-    url = f"https://api.instantly.ai/api/v2/leads/{instantly_lead_id}"
+    logger.info("Attempting to set status ID: %s for %s", status_id, email)
+    url = "https://api.instantly.ai/api/v2/leads/update-interest-status"
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {api_key}",
     }
-    payload = {"lt_interest_status": status_id}
+    payload = {
+        "lead_email": email,
+        "campaign_id": instantly_campaign_id,
+        "interest_value": status_id,
+    }
 
     timeout = httpx.Timeout(10.0, connect=5.0)
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
-            resp = await client.patch(url, headers=headers, json=payload)
+            resp = await client.post(url, headers=headers, json=payload)
 
         if resp.status_code >= 400:
             logger.warning(
