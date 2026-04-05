@@ -693,19 +693,29 @@ async def trigger_visit(request: Request) -> JSONResponse:
         )
 
     email = (data.get("email") or "").strip()
-    if not email:
+    lid = (data.get("lid") or "").strip()
+
+    if not email and not lid:
         return JSONResponse(
             status_code=400,
-            content={"status": "error", "reason": "empty_email"},
+            content={"status": "error", "reason": "email_or_lid_required"},
         )
 
-    logger.info("trigger_visit email=%s", email)
+    lookup_key = f"lid={lid}" if lid else f"email={email}"
+    logger.info("trigger_visit %s", lookup_key)
 
-    # --- Step 1: Look up the email in the Master Airtable Database ---
+    # --- Step 1: Look up in the Master Airtable Database ---
+    # Supports two modes:
+    #   - lid (Instantly lead ID) — direct lookup, used by new Vyzz audit flow
+    #   - email — fallback, used by legacy GEO6 dashboard flow
     table = _master_airtable_table()
 
-    escaped_email = _escape_airtable_string(email)
-    formula = f'LOWER({{{EMAIL_COL}}}) = LOWER("{escaped_email}")'
+    if lid:
+        escaped_lid = _escape_airtable_string(lid)
+        formula = f'{{{ID_COL}}} = "{escaped_lid}"'
+    else:
+        escaped_email = _escape_airtable_string(email)
+        formula = f'LOWER({{{EMAIL_COL}}}) = LOWER("{escaped_email}")'
 
     try:
         matches = table.all(
@@ -713,7 +723,7 @@ async def trigger_visit(request: Request) -> JSONResponse:
             fields=[EMAIL_COL, ID_COL, "instantly_campaign_id"],
         )
     except Exception as e:
-        logger.exception("trigger_visit airtable_search_failed email=%s", email)
+        logger.exception("trigger_visit airtable_search_failed %s", lookup_key)
         return JSONResponse(
             status_code=500,
             content={"status": "error", "reason": f"airtable_search_failed: {e}"},
@@ -721,10 +731,10 @@ async def trigger_visit(request: Request) -> JSONResponse:
 
     # --- Step 2: Verification ---
     if not matches:
-        logger.info("trigger_visit email_not_found email=%s", email)
+        logger.info("trigger_visit not_found %s", lookup_key)
         return JSONResponse(
             status_code=200,
-            content={"status": "ignored", "reason": "email_not_found"},
+            content={"status": "ignored", "reason": "not_found"},
         )
 
     record = matches[0]
@@ -732,12 +742,15 @@ async def trigger_visit(request: Request) -> JSONResponse:
 
     instantly_lead_id = fields.get(ID_COL)
     instantly_campaign_id = fields.get("instantly_campaign_id")
+    # Resolve email from Airtable if we searched by lid (needed for Instantly API)
+    if not email:
+        email = (fields.get(EMAIL_COL) or "").strip()
 
     # --- Step 3: Sync check ---
     if _is_blank(instantly_lead_id) or _is_blank(instantly_campaign_id):
         logger.info(
-            "trigger_visit not_synced email=%s lead_id=%s campaign_id=%s",
-            email,
+            "trigger_visit not_synced %s lead_id=%s campaign_id=%s",
+            lookup_key,
             instantly_lead_id,
             instantly_campaign_id,
         )
@@ -764,7 +777,7 @@ async def trigger_visit(request: Request) -> JSONResponse:
             content={"status": "error", "reason": "instantly_status_label_not_found"},
         )
 
-    logger.info("Attempting to set status ID: %s for %s", status_id, email)
+    logger.info("Attempting to set status ID: %s for %s", status_id, lookup_key)
     url = "https://api.instantly.ai/api/v2/leads/update-interest-status"
     headers = {
         "Content-Type": "application/json",
@@ -797,7 +810,7 @@ async def trigger_visit(request: Request) -> JSONResponse:
                 },
             )
 
-        logger.info("trigger_visit instantly_update_ok email=%s", email)
+        logger.info("trigger_visit instantly_update_ok %s", lookup_key)
         return JSONResponse(
             status_code=200,
             content={
@@ -808,7 +821,7 @@ async def trigger_visit(request: Request) -> JSONResponse:
         )
 
     except Exception as e:
-        logger.exception("trigger_visit instantly_request_failed email=%s", email)
+        logger.exception("trigger_visit instantly_request_failed %s", lookup_key)
         return JSONResponse(
             status_code=500,
             content={"status": "error", "reason": f"instantly_request_failed: {e}"},
